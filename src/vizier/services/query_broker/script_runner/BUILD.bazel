@@ -23,6 +23,7 @@ go_library(
     importpath = "px.dev/pixie/src/vizier/services/query_broker/script_runner",
     visibility = ["//visibility:public"],
     deps = [
+        "//src/api/proto/uuidpb:uuid_pl_go_proto",
         "//src/api/proto/vizierpb:vizier_pl_go_proto",
         "//src/carnot/planner/compilerpb:compiler_status_pl_go_proto",
         "//src/common/base/statuspb:status_pl_go_proto",
