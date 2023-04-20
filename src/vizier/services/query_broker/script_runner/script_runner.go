@@ -408,7 +408,8 @@ px.export(
 `,
 			Configs: `
 otelEndpointConfig:
-	url: "wavefront-proxy.observability-system.svc.cluster.local:4317"
+  url: wavefront-proxy.observability-system.svc.cluster.local:4317
+  insecure: true
 `,
 			FrequencyS: 60,
 		},
@@ -416,6 +417,7 @@ otelEndpointConfig:
 
 	// Add runners.
 	for k, v := range scripts {
+		log.Infof("Upserting Script %s: id=%s, config=%s", k, v.ID.String(), v.Configs)
 		err := s.upsertScript(uuid.FromStringOrNil(k), v)
 		if err != nil {
 			log.WithError(err).Error("Failed to upsert script, skipping...")
