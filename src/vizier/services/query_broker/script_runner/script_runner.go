@@ -73,15 +73,12 @@ type ScriptRunner struct {
 	runnerMap   map[uuid.UUID]*runner
 	runnerMapMu sync.Mutex
 
-	// scriptLastUpdateTime tracks the last time we latest update we processed for a script.
-	// As we may receive updates out-of-order, this prevents us from processing a change out-of-order.
-	scriptLastUpdateTime map[uuid.UUID]int64
-	updateTimeMu         sync.Mutex
-	cancelFunc           func()
-	once                 sync.Once
-	updatesCh            chan *cvmsgspb.CronScriptUpdate
-	baseCtx              context.Context
-	sources              []Source
+	cancelFunc func()
+	once       sync.Once
+	upsertCh   chan *cvmsgspb.CronScript
+	deleteCh   chan uuid.UUID
+	baseCtx    context.Context
+	sources    []Source
 }
 
 // New creates a new script runner.
@@ -92,7 +89,6 @@ func New(
 	scriptSources ...Source,
 ) *ScriptRunner {
 	baseCtx, cancel := context.WithCancel(context.Background())
-	updatesCh := make(chan *cvmsgspb.CronScriptUpdate, 4096)
 	return &ScriptRunner{
 		csClient:   csClient,
 		vzClient:   vzClient,
@@ -100,11 +96,10 @@ func New(
 
 		runnerMap: make(map[uuid.UUID]*runner),
 
-		scriptLastUpdateTime: make(map[uuid.UUID]int64),
-
 		cancelFunc: cancel,
 		once:       sync.Once{},
-		updatesCh:  updatesCh,
+		upsertCh:   make(chan *cvmsgspb.CronScript, 4096),
+		deleteCh:   make(chan uuid.UUID, 4096),
 		baseCtx:    baseCtx,
 		sources:    scriptSources,
 	}
@@ -128,12 +123,9 @@ func (s *ScriptRunner) Stop() {
 // SyncScripts syncs the known set of scripts in Vizier with scripts in Cloud.
 func (s *ScriptRunner) SyncScripts() error {
 	for _, source := range s.sources {
-		err := source.Start(s.baseCtx, s.updatesCh)
+		err := source.Start(s.baseCtx, s.upsertCh, s.deleteCh)
 		if err != nil {
 			return err
-		}
-		for k, v := range source.GetInitialScripts() {
-			s.upsertScript(uuid.FromStringOrNil(k), v)
 		}
 	}
 	s.processUpdates()
@@ -145,37 +137,16 @@ func (s *ScriptRunner) processUpdates() {
 		select {
 		case <-s.baseCtx.Done():
 			return
-		case update := <-s.updatesCh:
-			switch update.Msg.(type) {
-			case *cvmsgspb.CronScriptUpdate_UpsertReq:
-				req := update.GetUpsertReq()
-				sID := utils.UUIDFromProtoOrNil(req.Script.ID)
-				s.executeInOrder(sID, update.Timestamp, func() {
-					s.upsertScript(sID, req.Script)
-				})
-			case *cvmsgspb.CronScriptUpdate_DeleteReq:
-				req := update.GetDeleteReq()
-				sID := utils.UUIDFromProtoOrNil(req.ScriptID)
-				s.executeInOrder(sID, update.Timestamp, func() {
-					s.deleteScript(sID)
-				})
-			default:
-				log.Error("Received unknown message for cronScriptUpdate")
-			}
+		case update := <-s.upsertCh:
+			s.upsertScript(update)
+		case deletedID := <-s.deleteCh:
+			s.deleteScript(deletedID)
 		}
 	}
 }
 
-func (s *ScriptRunner) executeInOrder(sID uuid.UUID, timestamp int64, exec func()) {
-	s.updateTimeMu.Lock()
-	defer s.updateTimeMu.Unlock()
-	if s.scriptLastUpdateTime[sID] < timestamp {
-		exec()
-		s.scriptLastUpdateTime[sID] = timestamp
-	}
-}
-
-func (s *ScriptRunner) upsertScript(id uuid.UUID, script *cvmsgspb.CronScript) {
+func (s *ScriptRunner) upsertScript(script *cvmsgspb.CronScript) {
+	id := utils.UUIDFromProtoOrNil(script.ID)
 	s.runnerMapMu.Lock()
 	defer s.runnerMapMu.Unlock()
 	if v, ok := s.runnerMap[id]; ok {

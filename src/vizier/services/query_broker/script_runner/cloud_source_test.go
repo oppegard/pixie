@@ -167,7 +167,8 @@ func TestCloudScriptsSource_InitialState(t *testing.T) {
 			}()
 
 			source := NewCloudSource(nc, fcs, "test")
-			err := source.Start(context.Background(), nil)
+			upsertCh, deleteCh := mockSourceReceiver()
+			err := source.Start(context.Background(), upsertCh, deleteCh)
 			require.NoError(t, err)
 			defer source.Stop()
 
@@ -217,14 +218,14 @@ func TestCloudScriptsSource_InitialState(t *testing.T) {
 			}
 		}()
 
-		updatesCh := mockUpdatesCh()
+		upsertCh, deleteCh := mockSourceReceiver()
 		source := NewCloudSource(nc, scs, "test")
-		err := source.Start(context.Background(), updatesCh)
+		err := source.Start(context.Background(), upsertCh, deleteCh)
 		require.Error(t, err)
 
 		sendUpdates(t, nc, sentUpdates)
 
-		requireNoReceive(t, updatesCh, time.Millisecond)
+		requireNoReceive(t, upsertCh, time.Millisecond)
 		for _, getCronScriptResponse := range gotCronScriptResponses {
 			requireNoReceive(t, getCronScriptResponse, time.Millisecond)
 		}
@@ -299,14 +300,14 @@ func TestCloudScriptsSource_InitialState(t *testing.T) {
 			}
 		}()
 
-		updatesCh := mockUpdatesCh()
+		upsertCh, deleteCh := mockSourceReceiver()
 		source := NewCloudSource(nc, scs, "test")
-		err := source.Start(context.Background(), updatesCh)
+		err := source.Start(context.Background(), upsertCh, deleteCh)
 		require.Error(t, err)
 
 		sendUpdates(t, nc, sentUpdates)
 
-		requireNoReceive(t, updatesCh, time.Millisecond)
+		requireNoReceive(t, upsertCh, time.Millisecond)
 		for _, getCronScriptResponse := range gotCronScriptResponses {
 			requireNoReceive(t, getCronScriptResponse, time.Millisecond)
 		}
@@ -335,8 +336,8 @@ func TestCloudScriptsSource_Updates(t *testing.T) {
 						UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
 							Script: &cvmsgspb.CronScript{
 								ID:         utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440002"),
-								Script:     "test script 1",
-								Configs:    "config1",
+								Script:     "test script 2",
+								Configs:    "config2",
 								FrequencyS: 123,
 							},
 						},
@@ -450,51 +451,58 @@ func TestCloudScriptsSource_Updates(t *testing.T) {
 				}
 			}()
 
-			updatesCh := mockUpdatesCh()
+			upsertCh, deleteCh := mockSourceReceiver()
 			source := NewCloudSource(nc, fcs, "test")
-			err := source.Start(context.Background(), updatesCh)
+			err := source.Start(context.Background(), upsertCh, deleteCh)
 			require.NoError(t, err)
 			defer source.Stop()
 
 			<-gotChecksumReq
 			sendUpdates(t, nc, test.updates)
 
-			missing := append([]*cvmsgspb.CronScriptUpdate{}, test.updates...)
-			var unexpected []*cvmsgspb.CronScriptUpdate
-			var actualUpdates []*cvmsgspb.CronScriptUpdate
-			for i := 0; i < len(test.updates); i++ {
-				select {
-				case actual := <-updatesCh:
-					actualUpdates = append(actualUpdates, actual)
-					anyMatches := false
-					for i, expected := range missing {
-						if reflect.DeepEqual(expected, actual) {
-							missing[i] = missing[len(missing)-1]
-							missing = missing[:len(missing)-1]
-							anyMatches = true
-							break
-						}
-					}
-					if !anyMatches {
-						unexpected = append(unexpected, actual)
-					}
-				case <-time.After(time.Millisecond):
-					break
-				}
+			var expectedUpserts []*cvmsgspb.CronScript
+			for _, initial := range test.scripts {
+				expectedUpserts = append(expectedUpserts, initial)
 			}
-			require.Empty(t, missing, "missing updates")
-			require.Empty(t, unexpected, "unexpected updates")
-
-			for _, update := range actualUpdates {
-				requireReceiveWithin(t, gotCronScriptResponses[update.RequestID], time.Millisecond)
+			var expectedDeletes []uuid.UUID
+			for _, update := range test.updates {
 				switch update.Msg.(type) {
 				case *cvmsgspb.CronScriptUpdate_UpsertReq:
-					req := update.GetUpsertReq()
-					require.Contains(t, fcs.scripts, utils.UUIDFromProtoOrNil(req.GetScript().GetID()))
+					expectedUpserts = append(expectedUpserts, update.GetUpsertReq().Script)
 				case *cvmsgspb.CronScriptUpdate_DeleteReq:
-					req := update.GetDeleteReq()
-					require.NotContains(t, fcs.scripts, utils.UUIDFromProtoOrNil(req.GetScriptID()))
+					expectedDeletes = append(expectedDeletes, utils.UUIDFromProtoOrNil(update.GetDeleteReq().ScriptID))
 				}
+			}
+
+			missingUpserts, unexpectedUpserts, allUpserts := diffMessages(expectedUpserts, upsertCh)
+			require.Empty(t, missingUpserts, "missing upserts")
+			require.Empty(t, unexpectedUpserts, "unexpected upserts")
+
+			missingDeletes, unexpectedDeletes, allDeletes := diffMessages(expectedDeletes, deleteCh)
+			require.Empty(t, missingDeletes, "missing deletes")
+			require.Empty(t, unexpectedDeletes, "unexpected deletes")
+
+			excludeCheckingForUpdates := map[uuid.UUID]bool{}
+			for _, update := range test.updates {
+				switch update.Msg.(type) {
+				case *cvmsgspb.CronScriptUpdate_DeleteReq:
+					excludeCheckingForUpdates[utils.UUIDFromProtoOrNil(update.GetDeleteReq().ScriptID)] = true
+				}
+			}
+
+			for _, update := range allUpserts {
+				id := utils.UUIDFromProtoOrNil(update.ID)
+				requireReceiveWithin(t, gotCronScriptResponses[id], time.Second)
+				if excludeCheckingForUpdates[id] {
+					continue
+				}
+				require.Contains(t, fcs.scripts, id)
+			}
+
+			for _, id := range allDeletes {
+				requireReceiveWithin(t, gotCronScriptResponses[id], time.Second)
+				require.NotContains(t, fcs.scripts, id)
+				excludeCheckingForUpdates[id] = true
 			}
 		})
 	}
@@ -532,19 +540,44 @@ func TestCloudScriptsSource_Updates(t *testing.T) {
 			}
 		}()
 
-		updatesCh := mockUpdatesCh()
+		upsertCh, deleteCh := mockSourceReceiver()
 		source := NewCloudSource(nc, fcs, "test")
-		err := source.Start(context.Background(), updatesCh)
+		err := source.Start(context.Background(), upsertCh, deleteCh)
 		require.NoError(t, err)
 		source.Stop()
 
 		sendUpdates(t, nc, sentUpdates)
 
-		requireNoReceive(t, updatesCh, time.Millisecond)
+		requireNoReceive(t, upsertCh, time.Millisecond)
+		requireNoReceive(t, deleteCh, time.Millisecond)
 		for _, getCronScriptResponse := range gotCronScriptResponses {
 			requireNoReceive(t, getCronScriptResponse, time.Millisecond)
 		}
 	})
+}
+
+func diffMessages[T any](expected []T, msgs chan T) (missing []T, unexpected []T, all []T) {
+	for len(expected) > 0 {
+		select {
+		case actual := <-msgs:
+			all = append(all, actual)
+			anyMatches := false
+			for i := 0; i < len(expected); i++ {
+				if reflect.DeepEqual(expected[i], actual) {
+					expected[i] = expected[len(expected)-1]
+					expected = expected[:len(expected)-1]
+					anyMatches = true
+					break
+				}
+			}
+			if !anyMatches {
+				unexpected = append(unexpected, actual)
+			}
+		case <-time.After(time.Second):
+			break
+		}
+	}
+	return expected, unexpected, all
 }
 
 func sendUpdates(t *testing.T, nc *nats.Conn, updates []*cvmsgspb.CronScriptUpdate) {
@@ -635,14 +668,21 @@ func setupChecksumSubscription(t *testing.T, nc *nats.Conn, cloudScripts map[str
 	return checksumSub, gotChecksumReq
 }
 
-func setupCronScriptResponses(t *testing.T, nc *nats.Conn, updates []*cvmsgspb.CronScriptUpdate) (map[string]*nats.Subscription, map[string]chan struct{}) {
-	subs := map[string]*nats.Subscription{}
-	gotResponses := map[string]chan struct{}{}
+func setupCronScriptResponses(t *testing.T, nc *nats.Conn, updates []*cvmsgspb.CronScriptUpdate) (map[uuid.UUID]*nats.Subscription, map[uuid.UUID]chan struct{}) {
+	subs := map[uuid.UUID]*nats.Subscription{}
+	gotResponses := map[uuid.UUID]chan struct{}{}
 	for _, update := range updates {
 		func(update *cvmsgspb.CronScriptUpdate) {
 			var err error
-			gotResponses[update.RequestID] = make(chan struct{}, 1)
-			subs[update.RequestID], err = nc.Subscribe(fmt.Sprintf("%s:%s", CronScriptUpdatesResponseChannel, update.RequestID), func(msg *nats.Msg) {
+			var id uuid.UUID
+			switch update.Msg.(type) {
+			case *cvmsgspb.CronScriptUpdate_UpsertReq:
+				id = utils.UUIDFromProtoOrNil(update.GetUpsertReq().Script.ID)
+			case *cvmsgspb.CronScriptUpdate_DeleteReq:
+				id = utils.UUIDFromProtoOrNil(update.GetDeleteReq().ScriptID)
+			}
+			gotResponses[id] = make(chan struct{}, 1024)
+			subs[id], err = nc.Subscribe(fmt.Sprintf("%s:%s", CronScriptUpdatesResponseChannel, update.RequestID), func(msg *nats.Msg) {
 				v2cMsg := &cvmsgspb.V2CMessage{}
 				err := proto.Unmarshal(msg.Data, v2cMsg)
 				require.NoError(t, err)
@@ -658,7 +698,7 @@ func setupCronScriptResponses(t *testing.T, nc *nats.Conn, updates []*cvmsgspb.C
 				default:
 					t.Fatalf("unexpected conn script response %s", reflect.TypeOf(update.Msg).Name())
 				}
-				gotResponses[update.RequestID] <- struct{}{}
+				gotResponses[id] <- struct{}{}
 			})
 			require.NoError(t, err)
 		}(update)

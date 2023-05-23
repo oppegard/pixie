@@ -21,19 +21,16 @@ package scriptrunner
 import (
 	"context"
 
+	"github.com/gofrs/uuid"
 	"px.dev/pixie/src/shared/cvmsgspb"
 )
 
 // A Source provides an initial set of cron scripts and sends incremental updates to that set.
 type Source interface {
-	// Start sends updates on updatesCh. It does not block.
-	Start(baseCtx context.Context, updatesCh chan<- *cvmsgspb.CronScriptUpdate) error
+	// Start sends updates on upsertCh. It does not block.
+	Start(baseCtx context.Context, upsert chan *cvmsgspb.CronScript, delete chan uuid.UUID) error
 
-	// GetInitialScripts returns the initial set of scripts that all updates will be based on.
-	// This method must not be called before Start.
-	GetInitialScripts() map[string]*cvmsgspb.CronScript
-
-	// Stop sending updates on the updatesCh provided in Start.
+	// Stop sending updates on the upsertCh provided in Start.
 	// This method must not be called before Start.
 	Stop()
 }

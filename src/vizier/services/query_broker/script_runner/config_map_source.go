@@ -20,8 +20,8 @@ package scriptrunner
 
 import (
 	"context"
-	"time"
 
+	"github.com/gofrs/uuid"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
@@ -35,9 +35,8 @@ import (
 
 // ConfigMapSource pulls cron scripts from config maps.
 type ConfigMapSource struct {
-	scripts map[string]*cvmsgspb.CronScript
-	stop    func()
-	client  clientv1.ConfigMapInterface
+	stop   func()
+	client clientv1.ConfigMapInterface
 }
 
 // NewConfigMapSource constructs a [Source] that extracts cron scripts from config maps with the label "purpose=cron-script".
@@ -49,36 +48,29 @@ func NewConfigMapSource(client clientv1.ConfigMapInterface) *ConfigMapSource {
 	return &ConfigMapSource{client: client}
 }
 
-// Start watches for updates to matching configmaps and sends resulting updates on updatesCh.
-func (source *ConfigMapSource) Start(baseCtx context.Context, updatesCh chan<- *cvmsgspb.CronScriptUpdate) error {
+// Start watches for updates to matching configmaps and sends resulting updates on upsertCh.
+func (source *ConfigMapSource) Start(baseCtx context.Context, upsertCh chan *cvmsgspb.CronScript, deleteCh chan uuid.UUID) error {
 	options := metav1.ListOptions{LabelSelector: "purpose=cron-script"}
 	watcher, err := source.client.Watch(baseCtx, options)
 	if err != nil {
 		return err
 	}
-	go configMapUpdater(watcher, updatesCh)
+	go configMapUpdater(watcher, upsertCh, deleteCh)
 	configmaps, err := source.client.List(baseCtx, options)
 	if err != nil {
 		watcher.Stop()
 		return err
 	}
-	scripts := map[string]*cvmsgspb.CronScript{}
 	for _, configmap := range configmaps.Items {
-		id, cronScript, err := configmapToCronScript(&configmap)
+		_, script, err := configmapToCronScript(&configmap)
 		if err != nil {
 			logCronScriptParseError(err)
 			continue
 		}
-		scripts[id] = cronScript
+		upsertCh <- script
 	}
-	source.scripts = scripts
 	source.stop = watcher.Stop
 	return nil
-}
-
-// GetInitialScripts returns the initial set of scripts that all updates will be based on.
-func (source *ConfigMapSource) GetInitialScripts() map[string]*cvmsgspb.CronScript {
-	return source.scripts
 }
 
 // Stop stops further updates from being sent.
@@ -86,43 +78,25 @@ func (source *ConfigMapSource) Stop() {
 	source.stop()
 }
 
-func configMapUpdater(watcher watch.Interface, updatesCh chan<- *cvmsgspb.CronScriptUpdate) {
+func configMapUpdater(watcher watch.Interface, upsertCh chan *cvmsgspb.CronScript, deleteCh chan uuid.UUID) {
 	for event := range watcher.ResultChan() {
 		switch event.Type {
 		case watch.Modified, watch.Added:
 			configmap := event.Object.(*v1.ConfigMap)
-			id, script, err := configmapToCronScript(configmap)
+			_, script, err := configmapToCronScript(configmap)
 			if err != nil {
 				logCronScriptParseError(err)
 				continue
 			}
-			cronScriptUpdate := &cvmsgspb.CronScriptUpdate{
-				Msg: &cvmsgspb.CronScriptUpdate_UpsertReq{
-					UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
-						Script: script,
-					},
-				},
-				RequestID: id,
-				Timestamp: time.Now().Unix(),
-			}
-			updatesCh <- cronScriptUpdate
+			upsertCh <- script
 		case watch.Deleted:
 			configmap := event.Object.(*v1.ConfigMap)
-			id, script, err := configmapToCronScript(configmap)
+			id, _, err := configmapToCronScript(configmap)
 			if err != nil {
 				logCronScriptParseError(err)
 				continue
 			}
-			cronScriptUpdate := &cvmsgspb.CronScriptUpdate{
-				Msg: &cvmsgspb.CronScriptUpdate_DeleteReq{
-					DeleteReq: &cvmsgspb.DeleteCronScriptRequest{
-						ScriptID: script.ID,
-					},
-				},
-				RequestID: id,
-				Timestamp: time.Now().Unix(),
-			}
-			updatesCh <- cronScriptUpdate
+			deleteCh <- id
 		}
 	}
 }
@@ -131,7 +105,7 @@ func logCronScriptParseError(err error) {
 	log.WithError(err).Error("Failed to parse cron.yaml from configmap cron script")
 }
 
-func configmapToCronScript(configmap *v1.ConfigMap) (string, *cvmsgspb.CronScript, error) {
+func configmapToCronScript(configmap *v1.ConfigMap) (uuid.UUID, *cvmsgspb.CronScript, error) {
 	id := string(configmap.UID)
 	cronScript := &cvmsgspb.CronScript{
 		ID:      utils.ProtoFromUUIDStrOrNil(id),
@@ -141,10 +115,10 @@ func configmapToCronScript(configmap *v1.ConfigMap) (string, *cvmsgspb.CronScrip
 	var cronData cronYAML
 	err := yaml.Unmarshal([]byte(configmap.Data["cron.yaml"]), &cronData)
 	if err != nil {
-		return "", nil, err
+		return uuid.Nil, nil, err
 	}
 	cronScript.FrequencyS = cronData.FrequencyS
-	return id, cronScript, nil
+	return uuid.FromStringOrNil(id), cronScript, nil
 }
 
 type cronYAML struct {

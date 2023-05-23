@@ -34,21 +34,16 @@ import (
 )
 
 type MockSource struct {
-	scriptDelegate func() map[string]*cvmsgspb.CronScript
-	stopDelegate   func()
-	startDelegate  func(baseCtx context.Context, updatesCh chan<- *cvmsgspb.CronScriptUpdate) error
-}
-
-func (m *MockSource) GetInitialScripts() map[string]*cvmsgspb.CronScript {
-	return m.scriptDelegate()
+	stopDelegate  func()
+	startDelegate func(baseCtx context.Context, upsertCh chan *cvmsgspb.CronScript, deleteCh chan uuid.UUID) error
 }
 
 func (m *MockSource) Stop() {
 	m.stopDelegate()
 }
 
-func (m *MockSource) Start(baseCtx context.Context, updatesCh chan<- *cvmsgspb.CronScriptUpdate) error {
-	return m.startDelegate(baseCtx, updatesCh)
+func (m *MockSource) Start(baseCtx context.Context, upsertCh chan *cvmsgspb.CronScript, deleteCh chan uuid.UUID) error {
+	return m.startDelegate(baseCtx, upsertCh, deleteCh)
 }
 
 func requireNoReceive[T any](t *testing.T, messages chan T, timeout time.Duration) {
@@ -74,24 +69,19 @@ func requireReceiveWithin[T any](t *testing.T, messages chan T, timeout time.Dur
 
 func fakeSource(scripts map[string]*cvmsgspb.CronScript, stop func(), err error) Source {
 	return &MockSource{
-		startDelegate: func(_ context.Context, _ chan<- *cvmsgspb.CronScriptUpdate) error {
+		startDelegate: func(_ context.Context, upsertCh chan *cvmsgspb.CronScript, _ chan uuid.UUID) error {
+			for _, script := range scripts {
+				upsertCh <- script
+			}
 			return err
 		},
-		scriptDelegate: func() map[string]*cvmsgspb.CronScript {
-			return scripts
-		},
-		stopDelegate: func() {
-			stop()
-		},
+		stopDelegate: stop,
 	}
 }
 
 func dummySource() Source {
 	return &MockSource{
-		startDelegate: func(_ context.Context, _ chan<- *cvmsgspb.CronScriptUpdate) error {
-			return nil
-		},
-		scriptDelegate: func() map[string]*cvmsgspb.CronScript {
+		startDelegate: func(_ context.Context, _ chan *cvmsgspb.CronScript, _ chan uuid.UUID) error {
 			return nil
 		},
 		stopDelegate: func() {},
@@ -100,11 +90,8 @@ func dummySource() Source {
 
 func errorSource(err error) Source {
 	return &MockSource{
-		startDelegate: func(_ context.Context, _ chan<- *cvmsgspb.CronScriptUpdate) error {
+		startDelegate: func(_ context.Context, _ chan *cvmsgspb.CronScript, _ chan uuid.UUID) error {
 			return err
-		},
-		scriptDelegate: func() map[string]*cvmsgspb.CronScript {
-			return nil
 		},
 		stopDelegate: func() {},
 	}
@@ -225,6 +212,6 @@ func (f *FuncMatcher[T]) String() string {
 	return f.name
 }
 
-func mockUpdatesCh() chan *cvmsgspb.CronScriptUpdate {
-	return make(chan *cvmsgspb.CronScriptUpdate)
+func mockSourceReceiver() (upsertCh chan *cvmsgspb.CronScript, deleteCh chan uuid.UUID) {
+	return make(chan *cvmsgspb.CronScript, 1024), make(chan uuid.UUID, 1024)
 }
