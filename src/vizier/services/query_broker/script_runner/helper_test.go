@@ -21,6 +21,7 @@ package scriptrunner
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,13 +57,13 @@ func requireNoReceive[T any](t *testing.T, messages chan T, timeout time.Duratio
 	}
 }
 
-func requireReceiveWithin[T any](t *testing.T, messages chan T, timeout time.Duration) T {
+func requireReceiveWithin[T any](t *testing.T, messages chan T, timeout time.Duration, msgs ...string) T {
 	t.Helper()
 	var message T
 	select {
 	case message = <-messages:
 	case <-time.After(timeout):
-		t.Fatalf("did not receive a message within %s", timeout.String())
+		t.Fatalf("did not receive a message within %s: %s", timeout.String(), strings.Join(msgs, " "))
 	}
 	return message
 }

@@ -458,12 +458,17 @@ func TestCloudScriptsSource_Updates(t *testing.T) {
 			defer source.Stop()
 
 			<-gotChecksumReq
+			var expectedInitialUpserts []*cvmsgspb.CronScript
+			for _, initial := range test.scripts {
+				expectedInitialUpserts = append(expectedInitialUpserts, initial)
+			}
+			missingInitialUpserts, unexpectedInitialUpserts, _ := diffMessages(expectedInitialUpserts, upsertCh)
+			require.Empty(t, missingInitialUpserts, "missing upserts")
+			require.Empty(t, unexpectedInitialUpserts, "unexpected upserts")
+
 			sendUpdates(t, nc, test.updates)
 
 			var expectedUpserts []*cvmsgspb.CronScript
-			for _, initial := range test.scripts {
-				expectedUpserts = append(expectedUpserts, initial)
-			}
 			var expectedDeletes []uuid.UUID
 			for _, update := range test.updates {
 				switch update.Msg.(type) {
@@ -482,27 +487,15 @@ func TestCloudScriptsSource_Updates(t *testing.T) {
 			require.Empty(t, missingDeletes, "missing deletes")
 			require.Empty(t, unexpectedDeletes, "unexpected deletes")
 
-			excludeCheckingForUpdates := map[uuid.UUID]bool{}
-			for _, update := range test.updates {
-				switch update.Msg.(type) {
-				case *cvmsgspb.CronScriptUpdate_DeleteReq:
-					excludeCheckingForUpdates[utils.UUIDFromProtoOrNil(update.GetDeleteReq().ScriptID)] = true
-				}
+			for _, id := range allDeletes {
+				requireReceiveWithin(t, gotCronScriptResponses[id], time.Second, id.String())
+				require.NotContains(t, fcs.scripts, id)
 			}
 
 			for _, update := range allUpserts {
 				id := utils.UUIDFromProtoOrNil(update.ID)
-				requireReceiveWithin(t, gotCronScriptResponses[id], time.Second)
-				if excludeCheckingForUpdates[id] {
-					continue
-				}
+				requireReceiveWithin(t, gotCronScriptResponses[id], time.Second, id.String())
 				require.Contains(t, fcs.scripts, id)
-			}
-
-			for _, id := range allDeletes {
-				requireReceiveWithin(t, gotCronScriptResponses[id], time.Second)
-				require.NotContains(t, fcs.scripts, id)
-				excludeCheckingForUpdates[id] = true
 			}
 		})
 	}
@@ -554,6 +547,220 @@ func TestCloudScriptsSource_Updates(t *testing.T) {
 			requireNoReceive(t, getCronScriptResponse, time.Millisecond)
 		}
 	})
+}
+
+func TestCloudScriptsSource_UpdateOrdering(t *testing.T) {
+	tests := []struct {
+		name            string
+		scripts         map[string]*cvmsgspb.CronScript
+		updates         []*cvmsgspb.CronScriptUpdate
+		expectedUpserts int
+		expectedDeletes int
+	}{
+		{
+			name: "updates out of order",
+			updates: []*cvmsgspb.CronScriptUpdate{
+				{
+					Msg: &cvmsgspb.CronScriptUpdate_UpsertReq{
+						UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
+							Script: &cvmsgspb.CronScript{
+								ID:         utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+								Script:     "test script 2",
+								Configs:    "config2",
+								FrequencyS: 123,
+							},
+						},
+					},
+					RequestID: "2",
+					Timestamp: 2,
+				},
+				{
+					Msg: &cvmsgspb.CronScriptUpdate_UpsertReq{
+						UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
+							Script: &cvmsgspb.CronScript{
+								ID:         utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+								Script:     "test script 1",
+								Configs:    "config1",
+								FrequencyS: 123,
+							},
+						},
+					},
+					RequestID: "1",
+					Timestamp: 1,
+				},
+			},
+			expectedUpserts: 1,
+			expectedDeletes: 0,
+		},
+		{
+			name: "deletes out of order",
+			scripts: map[string]*cvmsgspb.CronScript{
+				"223e4567-e89b-12d3-a456-426655440001": {
+					ID:         utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+					Script:     "test script 1",
+					Configs:    "config1",
+					FrequencyS: 123,
+				},
+			},
+			updates: []*cvmsgspb.CronScriptUpdate{
+				{
+					Msg: &cvmsgspb.CronScriptUpdate_DeleteReq{
+						DeleteReq: &cvmsgspb.DeleteCronScriptRequest{
+							ScriptID: utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+						},
+					},
+					RequestID: "2",
+					Timestamp: 2,
+				},
+				{
+					Msg: &cvmsgspb.CronScriptUpdate_DeleteReq{
+						DeleteReq: &cvmsgspb.DeleteCronScriptRequest{
+							ScriptID: utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+						},
+					},
+					RequestID: "1",
+					Timestamp: 1,
+				},
+			},
+			expectedUpserts: 0,
+			expectedDeletes: 1,
+		},
+		{
+			name: "old update after delete",
+			scripts: map[string]*cvmsgspb.CronScript{
+				"223e4567-e89b-12d3-a456-426655440001": {
+					ID:         utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+					Script:     "test script 1",
+					Configs:    "config1",
+					FrequencyS: 123,
+				},
+			},
+			updates: []*cvmsgspb.CronScriptUpdate{
+				{
+					Msg: &cvmsgspb.CronScriptUpdate_DeleteReq{
+						DeleteReq: &cvmsgspb.DeleteCronScriptRequest{
+							ScriptID: utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+						},
+					},
+					RequestID: "2",
+					Timestamp: 2,
+				},
+				{
+					Msg: &cvmsgspb.CronScriptUpdate_UpsertReq{
+						UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
+							Script: &cvmsgspb.CronScript{
+								ID:         utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+								Script:     "test script 2",
+								Configs:    "config2",
+								FrequencyS: 123,
+							},
+						},
+					},
+					RequestID: "1",
+					Timestamp: 1,
+				},
+			},
+			expectedUpserts: 0,
+			expectedDeletes: 1,
+		},
+		{
+			name: "old delete after update",
+			scripts: map[string]*cvmsgspb.CronScript{
+				"223e4567-e89b-12d3-a456-426655440001": {
+					ID:         utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+					Script:     "test script 1",
+					Configs:    "config1",
+					FrequencyS: 123,
+				},
+			},
+			updates: []*cvmsgspb.CronScriptUpdate{
+				{
+					Msg: &cvmsgspb.CronScriptUpdate_UpsertReq{
+						UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
+							Script: &cvmsgspb.CronScript{
+								ID:         utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+								Script:     "test script 2",
+								Configs:    "config2",
+								FrequencyS: 123,
+							},
+						},
+					},
+					RequestID: "2",
+					Timestamp: 2,
+				},
+				{
+					Msg: &cvmsgspb.CronScriptUpdate_DeleteReq{
+						DeleteReq: &cvmsgspb.DeleteCronScriptRequest{
+							ScriptID: utils.ProtoFromUUIDStrOrNil("223e4567-e89b-12d3-a456-426655440001"),
+						},
+					},
+					RequestID: "1",
+					Timestamp: 1,
+				},
+			},
+			expectedUpserts: 1,
+			expectedDeletes: 0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nc, natsCleanup := testingutils.MustStartTestNATS(t)
+			defer natsCleanup()
+			persistedScripts := map[uuid.UUID]*cvmsgspb.CronScript{}
+			for id, script := range test.scripts {
+				persistedScripts[uuid.Must(uuid.FromString(id))] = script
+			}
+			fcs := &fakeCronStore{scripts: persistedScripts}
+
+			checksumSub, gotChecksumReq := setupChecksumSubscription(t, nc, test.scripts)
+			defer func() {
+				require.NoError(t, checksumSub.Unsubscribe())
+			}()
+
+			cronScriptResSubs, _ := setupCronScriptResponses(t, nc, test.updates)
+			defer func() {
+				for _, sub := range cronScriptResSubs {
+					require.NoError(t, sub.Unsubscribe())
+				}
+			}()
+
+			upsertCh, deleteCh := mockSourceReceiver()
+			source := NewCloudSource(nc, fcs, "test")
+			err := source.Start(context.Background(), upsertCh, deleteCh)
+			require.NoError(t, err)
+			defer source.Stop()
+
+			<-gotChecksumReq
+			var expectedInitialUpserts []*cvmsgspb.CronScript
+			for _, initial := range test.scripts {
+				expectedInitialUpserts = append(expectedInitialUpserts, initial)
+			}
+			missingInitialUpserts, unexpectedInitialUpserts, _ := diffMessages(expectedInitialUpserts, upsertCh)
+			require.Empty(t, missingInitialUpserts, "missing upserts")
+			require.Empty(t, unexpectedInitialUpserts, "unexpected upserts")
+
+			sendUpdates(t, nc, test.updates)
+
+			actualUpserts := countAll(upsertCh, time.Millisecond)
+			require.Equalf(t, test.expectedUpserts, actualUpserts, "expected %d upserts, but got %d", test.expectedUpserts, actualUpserts)
+
+			actualDeletes := countAll(deleteCh, time.Millisecond)
+			require.Equalf(t, test.expectedDeletes, actualDeletes, "expected %d deletes, but got %d", test.expectedUpserts, actualDeletes)
+		})
+	}
+}
+
+func countAll[T any](msgs chan T, timeout time.Duration) int {
+	count := 0
+	for {
+		select {
+		case <-msgs:
+			count++
+		case <-time.After(timeout):
+			return count
+		}
+	}
 }
 
 func diffMessages[T any](expected []T, msgs chan T) (missing []T, unexpected []T, all []T) {

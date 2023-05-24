@@ -227,38 +227,6 @@ func TestScriptRunner_ScriptUpdates(t *testing.T) {
 				},
 			},
 		},
-		{
-			name:     "discards out of order updates",
-			queryStr: "second updated script",
-			updates: []*cvmsgspb.CronScriptUpdate{
-				{
-					Msg: &cvmsgspb.CronScriptUpdate_UpsertReq{
-						UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
-							Script: &cvmsgspb.CronScript{
-								ID:         utils.ProtoFromUUIDStrOrNil(scriptID),
-								Script:     "second updated script",
-								Configs:    "otelEndpointConfig: {url: example.com}",
-								FrequencyS: 1,
-							},
-						},
-					},
-					Timestamp: 2,
-				},
-				{
-					Msg: &cvmsgspb.CronScriptUpdate_UpsertReq{
-						UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
-							Script: &cvmsgspb.CronScript{
-								ID:         utils.ProtoFromUUIDStrOrNil(scriptID),
-								Script:     "first updated script",
-								Configs:    "otelEndpointConfig: {url: example.com}",
-								FrequencyS: 1,
-							},
-						},
-					},
-					Timestamp: 1,
-				},
-			},
-		},
 	}
 
 	for _, test := range tests {
@@ -317,9 +285,8 @@ func TestScriptRunner_ScriptDeletes(t *testing.T) {
 	const scriptID = "223e4567-e89b-12d3-a456-426655440002"
 	const nonExistentScriptID = "223e4567-e89b-12d3-a456-426655440001"
 	tests := []struct {
-		name     string
-		queryStr string
-		updates  []*cvmsgspb.CronScriptUpdate
+		name    string
+		updates []*cvmsgspb.CronScriptUpdate
 	}{
 		{
 			name: "tracks deletes to cron scripts",
@@ -349,32 +316,6 @@ func TestScriptRunner_ScriptDeletes(t *testing.T) {
 					Msg: &cvmsgspb.CronScriptUpdate_DeleteReq{
 						DeleteReq: &cvmsgspb.DeleteCronScriptRequest{
 							ScriptID: utils.ProtoFromUUIDStrOrNil(scriptID),
-						},
-					},
-					Timestamp: 1,
-				},
-			},
-		},
-		{
-			name: "discards updates after deletes",
-			updates: []*cvmsgspb.CronScriptUpdate{
-				{
-					Msg: &cvmsgspb.CronScriptUpdate_DeleteReq{
-						DeleteReq: &cvmsgspb.DeleteCronScriptRequest{
-							ScriptID: utils.ProtoFromUUIDStrOrNil(scriptID),
-						},
-					},
-					Timestamp: 2,
-				},
-				{
-					Msg: &cvmsgspb.CronScriptUpdate_UpsertReq{
-						UpsertReq: &cvmsgspb.RegisterOrUpdateCronScriptRequest{
-							Script: &cvmsgspb.CronScript{
-								ID:         utils.ProtoFromUUIDStrOrNil(scriptID),
-								Script:     "updated script",
-								Configs:    "otelEndpointConfig: {url: example.com}",
-								FrequencyS: 1,
-							},
 						},
 					},
 					Timestamp: 1,
